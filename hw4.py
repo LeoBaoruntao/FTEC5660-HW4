@@ -38,7 +38,7 @@ from bs4 import BeautifulSoup
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from rank_bm25 import BM25Okapi
 
-VARIANT = os.getenv("HW4_VARIANT", "V3")
+VARIANT = os.getenv("HW4_VARIANT", "V4")
 COMPANIES = set()
 SPLITTER = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=120)
 
@@ -79,14 +79,16 @@ def parse_query(question: str) -> dict:
     names = [n for n in sorted(COMPANIES) if re.search(r"\b"+re.escape(n)+r"\b", question, re.I)]
     # Capture unfamiliar subjects in possessives and after auxiliary verbs.
     name = r"([A-Z][\w&.-]*(?:\s+[A-Z][\w&.-]*)*)"
-    for pattern in [name+r"['’]s?\b", r"(?:did|does|audited|for|give|is)\s+"+name+r"(?=\s+(?:hold|report|spend|earn|generate|announce|in|headquartered)|[,?])", r":\s*"+name+r"\s+or\s+",r"\bor\s+"+name+r"\?"]:
+    for pattern in [name+r"['’](?:s\b|(?=\s))", r"(?:did|does|audited|for|give|is)\s+"+name+r"(?=\s+(?:hold|report|spend|earn|generate|announce|in|headquartered)|[,?])", r":\s*"+name+r"\s+or\s+",r"\bor\s+"+name+r"\?"]:
         for value in re.findall(pattern, question):
             value = re.sub(r"^(?:What|Which|Who|How)\s+", "", value)
+            if re.fullmatch(r"FY\d{4}", value):
+                continue
             if not any(company_key(n)==company_key(value) for n in names):
                 names.append(value)
     year = re.search(r"(?:FY)?(20\d{2})\b", question)
     kind = "earnings_call" if "earnings call" in lower else (
-        "research_report" if re.search(r"target price|rating|forecast|results review|broker",lower) else "annual_report")
+        "research_report" if re.search(r"target price|\brating\b|forecast|results review|broker",lower) else "annual_report")
     return dict(companies=names, fiscal_year=int(year[1]) if year else None, doc_type=kind)
 
 
@@ -106,9 +108,11 @@ def retrieve(index, question: str) -> list[Document]:
     for company in query["companies"] or [None]:
         candidates = [i for i in ranked if chunks[i].metadata["doc_type"] == query["doc_type"]
                       and (not company or company_key(chunks[i].metadata["company"]) == company_key(company))]
-        if VARIANT == "V3":
+        if VARIANT == "V4":
             # Require at least one candidate document that covers the named year.
-            if year:
+            if year and query["doc_type"] == "annual_report":
+                candidates = [i for i in candidates if chunks[i].metadata["fiscal_year"] in {year, year + 1}]
+            elif year:
                 candidates = [i for i in candidates if str(year) in chunks[i].page_content
                               or chunks[i].metadata["fiscal_year"] == year]
             if not candidates:
@@ -120,6 +124,15 @@ def retrieve(index, question: str) -> list[Document]:
             pool = " ".join(chunks[i].page_content.lower() for i in candidates)
             if words and not any(w[:5] in pool for w in words):
                 return []
+            # An explicitly requested expenditure or rate needs its distinguishing noun.
+            focus = re.search(r"(?:spend on|spending on) (.+?) in (?:fy)?\d|(?:['’]s|s['’]) (.+?) (?:expenses|rate) in", question.lower())
+            if focus:
+                phrase = next(part for part in focus.groups() if part)
+                if not all(word[:5] in pool for word in phrase.split() if len(word) > 3):
+                    return []
+            qualifier = re.search(r"from (?:its|the) (.+?) in (?:fy)?\d", question.lower())
+            if qualifier and qualifier[1] not in pool:
+                return []
         def rank(i):
             chunk = chunks[i]
             score = scores[i]
@@ -127,13 +140,13 @@ def retrieve(index, question: str) -> list[Document]:
                 score += 7
             for line in chunk.page_content.lower().splitlines():
                 label = line.split("|")[0].strip()
-                if "|" in line and len(label)>2 and label in question.lower():
+                if "|" in line and len(label)>2 and label.rstrip("s") in question.lower():
                     score += 12
                     break
             return score
-        groups.append(sorted(candidates,key=rank,reverse=True)[:5])
+        groups.append((candidates if VARIANT == "V2" else sorted(candidates, key=rank, reverse=True))[:5])
     ordered = [g[pos] for pos in range(5) for g in groups if len(g)>pos]
-    if not ordered and VARIANT != "V3":
+    if not ordered and VARIANT != "V4":
         ordered = ranked
     return [chunks[i] for i in ordered[:5]]
 

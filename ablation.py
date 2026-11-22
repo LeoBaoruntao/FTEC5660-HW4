@@ -9,8 +9,8 @@ ROOT = Path(__file__).resolve().parent
 def main():
     output = ROOT / "experiments"
     output.mkdir(exist_ok=True)
-    for variant in sys.argv[1:] or ["B0", "V1", "V2", "V3"]:
-        if variant not in {"B0", "V1", "V2", "V3"}:
+    for variant in sys.argv[1:] or ["B0", "V1", "V2", "V3", "V4"]:
+        if variant not in {"B0", "V1", "V2", "V3", "V4"}:
             raise ValueError(variant)
         print("Running", variant, flush=True)
         target = output / (variant + ".csv")
@@ -22,7 +22,7 @@ def main():
         result.check_returncode()
         if "Generator failed" in result.stdout or "Traceback" in result.stderr:
             raise RuntimeError(f"Inspect experiments/{variant}.log before using this result.")
-        if variant == "V3":
+        if variant == "V4":
             (ROOT / "results.csv").write_bytes(target.read_bytes())
 
 if __name__ == "__main__":
