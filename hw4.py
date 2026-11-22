@@ -34,53 +34,108 @@ load_dotenv()
 # =============================================================================
 
 
-def table_to_text(table_html: str) -> str:
-    """Task 1.1: turn one HTML <table> into text that keeps every value with its row and its column.
+from bs4 import BeautifulSoup
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from rank_bm25 import BM25Okapi
 
-    Put each value on a line (at most 400 characters) together with its row label and its column
-    header, e.g. "Revenue | 2025: 2,710.4 | 2024: 2,629.1", one table row per line, keep the text of
-    every cell unchanged, and include the caption (it holds the unit) in the output. Do not call the
-    LLM here.
-    """
-    ### YOUR CODE HERE
-    return ""
+VARIANT = os.getenv("HW4_VARIANT", "V3")
+COMPANIES = set()
+SPLITTER = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=120)
+
+
+def table_to_text(table_html: str) -> str:
+    soup = BeautifulSoup(table_html, "html.parser")
+    rows = [[c.get_text(" ", strip=True) for c in row.find_all(["th", "td"])]
+            for row in soup.select("tr")]
+    lines = [soup.caption.get_text(" ", strip=True)] if soup.caption else []
+    if rows:
+        for row in rows[1:]:
+            if row:
+                lines.append(" | ".join([row[0], *(f"{h}: {v}" for h, v in zip(rows[0][1:], row[1:]))]))
+    return "\n".join(lines)
 
 
 def chunk_document(file_name: str, html: str) -> list[Document]:
-    """Task 1.2: split one document into chunks of at most MAX_CHUNK_CHARS characters.
-
-    Every chunk needs the metadata "source" (= file_name), "company", "fiscal_year" (an int) and
-    "doc_type" (one of DOC_TYPES). Do not call the LLM here.
-    """
-    ### YOUR CODE HERE
-    return []
+    soup = BeautifulSoup(html, "html.parser")
+    title = soup.title.get_text(" ", strip=True)
+    company = soup.h1.get_text(" ", strip=True).split("(")[0].strip()
+    company = re.sub(r"\s+(?:inc|ltd|plc|corp|corporation|limited|llc)\.?$", "", company, flags=re.I)
+    COMPANIES.add(company)
+    kind = "earnings_call" if "earnings call" in title.lower() else (
+        "research_report" if "research" in title.lower() or "results review" in title.lower() else "annual_report")
+    year = int(re.search(r"(?:FY|Year\s+|Report\s+)(20\d{2})", title, re.I)[1])
+    meta = dict(company=company, fiscal_year=year, doc_type=kind, source=file_name)
+    if VARIANT != "B0":
+        for table in soup.select("table"):
+            table.replace_with(table_to_text(str(table)))
+    return [Document(page_content=t, metadata=meta)
+            for t in SPLITTER.split_text(soup.get_text("\n", strip=True))]
 
 
 def parse_query(question: str) -> dict:
-    """Task 2.2: {"companies": [names], "fiscal_year": int or None, "doc_type": one of DOC_TYPES}.
+    if VARIANT in {"B0", "V1"}:
+        return {}
+    lower = question.lower()
+    names = [n for n in sorted(COMPANIES) if re.search(r"\b"+re.escape(n)+r"\b", question, re.I)]
+    # Capture unfamiliar subjects in possessives and after auxiliary verbs.
+    name = r"([A-Z][\w&.-]*(?:\s+[A-Z][\w&.-]*)*)"
+    for pattern in [name+r"['’]s?\b", r"(?:did|does|audited|for|give|is)\s+"+name+r"(?=\s+(?:hold|report|spend|earn|generate|announce|in|headquartered)|[,?])", r":\s*"+name+r"\s+or\s+",r"\bor\s+"+name+r"\?"]:
+        for value in re.findall(pattern, question):
+            value = re.sub(r"^(?:What|Which|Who|How)\s+", "", value)
+            if not any(company_key(n)==company_key(value) for n in names):
+                names.append(value)
+    year = re.search(r"(?:FY)?(20\d{2})\b", question)
+    kind = "earnings_call" if "earnings call" in lower else (
+        "research_report" if re.search(r"target price|rating|forecast|results review|broker",lower) else "annual_report")
+    return dict(companies=names, fiscal_year=int(year[1]) if year else None, doc_type=kind)
 
-    The rules for each field are under Task 2.2 in the handout. You may use make_llm() here.
-    """
-    ### YOUR CODE HERE
-    return {}
+
+def build_index(chunks: list[Document]):
+    return chunks, BM25Okapi([c.page_content.lower().split() for c in chunks])
 
 
-def build_index(chunks: list[Document]) -> Any:
-    """Task 2: index the chunks of the whole corpus (the output of chunk_document), once per run.
-
-    Return anything retrieve() needs: a BM25 or TF-IDF index, the chunks grouped by metadata, ...
-    """
-    ### YOUR CODE HERE
-    return None
-
-
-def retrieve(index: Any, question: str) -> list[Document]:
-    """Tasks 2 and 3: at most MAX_RETRIEVED of the chunks given to build_index, best first.
-
-    Return [] when the corpus cannot answer the question: the generator then answers NOT_FOUND.
-    """
-    ### YOUR CODE HERE
-    return []
+def retrieve(index, question: str) -> list[Document]:
+    chunks, bm25 = index
+    scores = bm25.get_scores(question.lower().split())
+    ranked = sorted(range(len(chunks)), key=scores.__getitem__, reverse=True)
+    if VARIANT in {"B0","V1"}:
+        return [chunks[i] for i in ranked[:5]]
+    query = parse_query(question)
+    year = query["fiscal_year"]
+    groups = []
+    for company in query["companies"] or [None]:
+        candidates = [i for i in ranked if chunks[i].metadata["doc_type"] == query["doc_type"]
+                      and (not company or company_key(chunks[i].metadata["company"]) == company_key(company))]
+        if VARIANT == "V3":
+            # Require at least one candidate document that covers the named year.
+            if year:
+                candidates = [i for i in candidates if str(year) in chunks[i].page_content
+                              or chunks[i].metadata["fiscal_year"] == year]
+            if not candidates:
+                return []
+            words = set(re.findall(r"[a-z]{4,}", question.lower()))
+            words -= set("what which company much million millions december were does higher more their with from that year single value cash fiscal report reported earn spend generate large many held have financial statements".split())
+            for n in query["companies"]:
+                words -= set(n.lower().split())
+            pool = " ".join(chunks[i].page_content.lower() for i in candidates)
+            if words and not any(w[:5] in pool for w in words):
+                return []
+        def rank(i):
+            chunk = chunks[i]
+            score = scores[i]
+            if chunk.metadata["fiscal_year"] == year:
+                score += 7
+            for line in chunk.page_content.lower().splitlines():
+                label = line.split("|")[0].strip()
+                if "|" in line and len(label)>2 and label in question.lower():
+                    score += 12
+                    break
+            return score
+        groups.append(sorted(candidates,key=rank,reverse=True)[:5])
+    ordered = [g[pos] for pos in range(5) for g in groups if len(g)>pos]
+    if not ordered and VARIANT != "V3":
+        ordered = ranked
+    return [chunks[i] for i in ordered[:5]]
 
 
 # =============================================================================
